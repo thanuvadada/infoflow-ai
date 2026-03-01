@@ -1,0 +1,201 @@
+
+/**
+ * Core Philosophy: This ruleset implements a hybrid security model. It combines strict user-ownership for personal data
+ * (queries, feedback) with a Role-Based Access Control (RBAC) system for global data. A dedicated '/roles_admin' collection
+ * serves as the single source of truth for identifying administrators, enabling efficient and secure permission checks.
+ *
+ * Data Structure: User-specific data is segregated and nested under '/users/{userId}', naturally scoping access. Global
+ * application data, such as '/documents' and '/tags', resides in top-level collections with broader access policies.
+ *
+ * Key Security Decisions:
+ * - Administrator Access: A user is considered an admin if a document with their UID exists in the '/roles_admin' collection.
+ *   This is checked using a highly performant `exists()` call.
+ * - User-Owned Data: All data under '/users/{userId}' is accessible only by the owning user or an administrator.
+ * - Public Data: Core knowledge base content like '/documents' is readable by any authenticated user. 
+ *   '/tags' can be read by any authenticated user, but only modified by an admin.
+ * - Default Deny: All access is denied by default. Unauthenticated users have no access to any data.
+ * - Denormalization for Authorization: User-owned documents contain a denormalized 'userId' field. The rules enforce that this
+ *   field matches the user ID in the document path on creation and remains immutable on update, ensuring path and data integrity.
+ *   This avoids costly `get()` calls in subcollection rules.
+ */
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // --------------------------------------------------------------------
+    // Helper Functions
+    // --------------------------------------------------------------------
+
+    /**
+     * Checks if the user is authenticated.
+     */
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    /**
+     * Checks if the requesting user is an administrator by verifying the
+     * existence of their UID in the /roles_admin collection.
+     */
+    function isAdmin() {
+      return exists(/databases/$(database)/documents/roles_admin/$(request.auth.uid));
+    }
+
+    /**
+     * Checks if the requesting user's UID matches the provided userId,
+     * establishing document ownership based on the path.
+     */
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    /**
+     * Grants access if the user is the direct owner OR an administrator.
+     * This is the primary rule for all user-owned data.
+     */
+    function isOwnerOrAdmin(userId) {
+      return isOwner(userId) || isAdmin();
+    }
+
+    /**
+     * Validates that the user ID embedded in a new UserQuery document
+     * matches the user ID in the path.
+     */
+    function isUserQueryDataValidOnCreate(userId) {
+      return request.resource.data.userId == userId;
+    }
+
+    /**
+     * Ensures the user ID in a UserQuery document cannot be changed after creation.
+     */
+    function isUserQueryDataValidOnUpdate() {
+      return request.resource.data.userId == resource.data.userId;
+    }
+
+    /**
+     * Validates that the user and query IDs embedded in a new Feedback document
+     * match the IDs in the path.
+     */
+    function isFeedbackDataValidOnCreate(userId, userQueryId) {
+      return request.resource.data.userId == userId
+          && request.resource.data.userQueryId == userQueryId;
+    }
+
+    /**
+     * Ensures the user and query IDs in a Feedback document cannot be changed.
+     */
+    function isFeedbackDataValidOnUpdate() {
+      return request.resource.data.userId == resource.data.userId
+          && request.resource.data.userQueryId == resource.data.userQueryId;
+    }
+
+    // --------------------------------------------------------------------
+    // Collection Rules
+    // --------------------------------------------------------------------
+
+    /**
+     * @description Stores public user profile information. Users can create/update their own
+     *   profile. Admins can list all users to manage roles.
+     * @path /users/{userId}
+     * @allow (create) A new user 'user_abc' creates their profile at '/users/user_abc'.
+     * @deny (list) A non-admin 'user_abc' tries to list all users.
+     * @principle Segregates public user data, allowing self-management and admin oversight.
+     */
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isAdmin();
+      allow create, update: if isOwner(userId);
+      allow delete: if false; 
+    }
+
+    /**
+     * @description Grants read access to all authenticated users for knowledge base documents.
+     *   Write access (create, update, delete) is restricted to administrators.
+     * @path /documents/{documentId}
+     * @allow (get) An authenticated user 'user_abc' reads a document.
+     * @deny (create) A non-admin user 'user_abc' attempts to upload a new document.
+     * @principle Public read for authenticated users, with writes restricted by admin role.
+     */
+    match /documents/{documentId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    /**
+     * @description Restricts all access to the SourceSystem configurations to administrators only.
+     *   This collection contains sensitive system integration details.
+     * @path /sourceSystems/{sourceSystemId}
+     * @allow (get) An admin user 'admin_xyz' reads a source system's configuration.
+     * @deny (list) A non-admin user 'user_abc' attempts to list source systems.
+     * @principle Restricts all access (read and write) to a specific administrative role.
+     */
+    match /sourceSystems/{sourceSystemId} {
+      allow read, write: if isAdmin();
+    }
+
+    /**
+     * @description Defines rules for user-specific data, primarily queries and feedback.
+     *   Access is scoped to the user whose ID is in the path.
+     * @path /users/{userId}
+     */
+    match /users/{userId} {
+      // Direct reads/writes on a user document are not defined/allowed.
+      allow read, write: if false;
+
+      /**
+       * @description A user can manage their own search queries. Administrators have override
+       *   access for support and moderation purposes.
+       * @path /users/{userId}/userQueries/{userQueryId}
+       * @allow (create) User 'user_abc' creates a query at '/users/user_abc/userQueries/query123'.
+       * @deny (get) User 'user_def' attempts to read a query from '/users/user_abc/userQueries/query123'.
+       * @principle Enforces data ownership within a user-specific data tree, with an admin escape hatch.
+       */
+      match /userQueries/{userQueryId} {
+        allow get, list, delete: if isOwnerOrAdmin(userId);
+        allow create: if isOwnerOrAdmin(userId) && isUserQueryDataValidOnCreate(userId);
+        allow update: if isOwnerOrAdmin(userId) && isUserQueryDataValidOnUpdate();
+
+        /**
+         * @description A user can provide feedback on their own queries. Administrators have override
+         *   access. Access is inherited from the user scope in the path.
+         * @path /users/{userId}/userQueries/{userQueryId}/feedback/{feedbackId}
+         * @allow (create) User 'user_abc' creates feedback for their query at '/users/user_abc/...'.
+         * @deny (update) User 'user_def' attempts to update feedback for user 'user_abc's query.
+         * @principle Enforces data ownership in a nested subcollection and validates relational integrity.
+         */
+        match /feedback/{feedbackId} {
+          allow get, list, delete: if isOwnerOrAdmin(userId);
+          allow create: if isOwnerOrAdmin(userId) && isFeedbackDataValidOnCreate(userId, userQueryId);
+          allow update: if isOwnerOrAdmin(userId) && isFeedbackDataValidOnUpdate();
+        }
+      }
+    }
+
+    /**
+     * @description Grants read access to all authenticated users for document tags. Only
+     *   administrators are permitted to create, modify, or delete tags.
+     * @path /tags/{tagId}
+     * @allow (list) An authenticated user 'user_abc' lists all available tags.
+     * @deny (delete) An authenticated user 'user_abc' tries to delete a tag.
+     * @principle Public read for authenticated users, with writes restricted by admin role.
+     */
+    match /tags/{tagId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isAdmin();
+    }
+
+    /**
+     * @description Manages the list of administrators. The existence of a document grants
+     *   admin rights. Only existing administrators can add or remove other admins.
+     * @path /roles_admin/{userId}
+     * @allow (create) An existing admin 'admin_xyz' adds 'user_abc' as a new admin.
+     * @deny (list) A non-admin user 'user_def' attempts to list all administrators.
+     * @principle Restricts management of administrative roles to other administrators.
+     */
+    match /roles_admin/{userId} {
+      allow get: if isOwnerOrAdmin(userId);
+      allow list: if isAdmin();
+      allow create, update, delete: if isAdmin();
+    }
+  }
+}
